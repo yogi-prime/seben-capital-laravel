@@ -15,96 +15,86 @@ use Illuminate\Support\Str;
 class PostController extends Controller
 {
     // GET /api/posts?q=&category_slug=&tag_slug=&status=&featured=1&page=1&per_page=12
-    public function index(Request $request)
-    {
-        // ---- request entry log ----
-        Log::info('Posts#index: incoming params', [
-            'query' => $request->query(),       // only querystring
-            'path'  => $request->path(),
-            'ip'    => $request->ip(),
-            'ua'    => substr((string) $request->userAgent(), 0, 255),
-        ]);
+  public function index(Request $request)
+{
+    Log::info('--- PostController@index called ---');
+    Log::debug('Request all inputs:', $request->all());
 
-        // Optional: listen each SQL for THIS request only
-        DB::listen(function ($query) {
-            Log::debug('SQL', [
-                'sql'      => $query->sql,
-                'bindings' => $query->bindings,
-                'time_ms'  => $query->time,
-            ]);
-        });
+    $perPage = min(50, (int)($request->integer('per_page') ?: 12));
+    Log::debug('Per page value set:', ['perPage' => $perPage]);
 
-        try {
-            $perPage = min(50, (int)($request->integer('per_page') ?: 12));
+    $q = Post::query()
+        ->with(['primaryCategory:id,name,slug', 'categories:id,name,slug', 'tags:id,name,slug']);
 
-            $q = Post::query()
-                ->with(['primaryCategory:id,name,slug', 'categories:id,name,slug', 'tags:id,name,slug'])
-                ->when($request->filled('status'), fn($qq) => $qq->where('status', $request->string('status')))
-                ->when($request->boolean('featured'), fn($qq) => $qq->where('is_featured', true))
-                ->when($request->filled('category_slug'), function ($qq) use ($request) {
-                    $slug = $request->string('category_slug');
-                    $qq->where(function ($w) use ($slug) {
-                        $w->whereHas('categories', fn($c) => $c->where('slug', $slug))
-                          ->orWhereHas('primaryCategory', fn($c) => $c->where('slug', $slug));
-                    });
-                })
-                ->when($request->filled('tag_slug'), fn($qq) =>
-                    $qq->whereHas('tags', fn($t) => $t->where('slug', $request->string('tag_slug')))
-                )
-                ->when($request->filled('q'), function ($qq) use ($request) {
-                    $term = $request->string('q');
-                    $qq->where(function ($w) use ($term) {
-                        $w->when(config('database.default') === 'mysql', function ($wt) use ($term) {
-                            $wt->whereRaw(
-                                "MATCH (title, excerpt, content_html) AGAINST (? IN NATURAL LANGUAGE MODE)",
-                                [$term]
-                            );
-                        }, function ($wt) use ($term) {
-                            $like = '%' . $term . '%';
-                            $wt->where('title', 'like', $like)
-                               ->orWhere('excerpt', 'like', $like)
-                               ->orWhere('content_html', 'like', $like);
-                        });
-                    });
-                })
-                ->orderByDesc('published_at')
-                ->orderByDesc('id');
+    Log::debug('Initial query with relationships loaded');
 
-            // (Optional) log a quick SQL preview (safe)
-            Log::debug('Posts#index: base query built');
-
-            $paginator = $q->paginate($perPage, [
-                'id','title','slug','excerpt','featured_image','featured_image_alt',
-                'seo_title','seo_description','published_at','read_time','word_count','is_featured','status'
-            ]);
-
-            // ---- response summary log ----
-            Log::info('Posts#index: response summary', [
-                'per_page'  => $paginator->perPage(),
-                'current'   => $paginator->currentPage(),
-                'last_page' => $paginator->lastPage(),
-                'count'     => $paginator->count(),
-                'total'     => $paginator->total(),
-            ]);
-
-            return response()->json($paginator);
-        } catch (\Throwable $e) {
-            // ---- error log with context ----
-            Log::error('Posts#index: exception', [
-                'message' => $e->getMessage(),
-                'code'    => $e->getCode(),
-                'file'    => $e->getFile(),
-                'line'    => $e->getLine(),
-                'trace'   => app()->environment('local') ? $e->getTraceAsString() : null,
-                'params'  => $request->query(),
-            ]);
-
-            // Clean error to API consumer
-            return response()->json([
-                'message' => 'Failed to fetch posts.',
-            ], 500);
-        }
+    // STATUS FILTER
+    if ($request->filled('status')) {
+        $status = $request->string('status');
+        $q->where('status', $status);
+        Log::debug('Applied status filter:', ['status' => $status]);
     }
+
+    // FEATURED FILTER
+    if ($request->boolean('featured')) {
+        $q->where('is_featured', true);
+        Log::debug('Applied featured filter: true');
+    }
+
+    // CATEGORY FILTER
+    if ($request->filled('category_slug')) {
+        $slug = $request->string('category_slug');
+        $q->where(function ($w) use ($slug) {
+            $w->whereHas('categories', fn($c) => $c->where('slug', $slug))
+              ->orWhereHas('primaryCategory', fn($c) => $c->where('slug', $slug));
+        });
+        Log::debug('Applied category filter:', ['category_slug' => $slug]);
+    }
+
+    // TAG FILTER
+    if ($request->filled('tag_slug')) {
+        $tag = $request->string('tag_slug');
+        $q->whereHas('tags', fn($t) => $t->where('slug', $tag));
+        Log::debug('Applied tag filter:', ['tag_slug' => $tag]);
+    }
+
+    // SEARCH TERM FILTER
+    if ($request->filled('q')) {
+        $term = $request->string('q');
+        Log::debug('Applying search term filter:', ['q' => $term]);
+        $q->where(function ($w) use ($term) {
+            if (config('database.default') === 'mysql') {
+                $w->whereRaw("MATCH (title, excerpt, content_html) AGAINST (? IN NATURAL LANGUAGE MODE)", [$term]);
+                Log::debug('Used FULLTEXT search mode for MySQL');
+            } else {
+                $like = '%' . $term . '%';
+                $w->where('title', 'like', $like)
+                    ->orWhere('excerpt', 'like', $like)
+                    ->orWhere('content_html', 'like', $like);
+                Log::debug('Used LIKE search fallback');
+            }
+        });
+    }
+
+    $q->orderByDesc('published_at')->orderByDesc('id');
+    Log::debug('Applied ordering: published_at desc, id desc');
+
+    // Execute the query with pagination
+    $posts = $q->paginate($perPage, [
+        'id','title','slug','excerpt','featured_image','featured_image_alt',
+        'seo_title','seo_description','published_at','read_time','word_count','is_featured','status'
+    ]);
+
+    Log::info('Query executed successfully', [
+        'total' => $posts->total(),
+        'current_page' => $posts->currentPage(),
+        'per_page' => $posts->perPage(),
+        'count' => $posts->count(),
+    ]);
+
+    return $posts;
+}
+
     // GET /api/posts/{slug}
     public function showBySlug(string $slug)
     {
